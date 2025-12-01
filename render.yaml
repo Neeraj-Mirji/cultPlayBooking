@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: cult-booker-bot
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn main:app --worker-class=gthread --threads 4 --bind 0.0.0.0:$PORT"
+    # optionally add instanceType, disk, etc.
