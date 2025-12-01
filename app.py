@@ -58,35 +58,53 @@ _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_event = threading.Event()  # True -> scheduler running
 
 # ---------------------------------------------------------------------
-# Telegram Helper
+# Utilities for logging
+# ---------------------------------------------------------------------
+def log(msg: str):
+    """Print + logger for Render logs visibility."""
+    print(msg, flush=True)
+    app.logger.info(msg)
+
+def log_exc(msg: str):
+    print(msg, flush=True)
+    app.logger.exception(msg)
+
+# ---------------------------------------------------------------------
+# Telegram Helper (plain-text messages for reliability)
 # ---------------------------------------------------------------------
 def send_telegram(message: str, chat_id: Optional[str] = None):
+    """Send a plain-text Telegram message (no markdown to avoid escaping issues)."""
     try:
         if not TELEGRAM_BOT_TOKEN:
-            app.logger.warning("No TELEGRAM_BOT_TOKEN set; cannot send message.")
+            log("No TELEGRAM_BOT_TOKEN set; cannot send Telegram message.")
             return
 
         target_chat = chat_id or TELEGRAM_CHAT_ID
         if not target_chat:
-            app.logger.warning("No chat_id to send Telegram message.")
+            log("No Telegram chat_id configured; skipping send.")
             return
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": target_chat, "text": message}
-        requests.post(url, data=payload, timeout=6)
-        app.logger.info(f"Sent Telegram message to {target_chat}")
+        # Post with a small timeout so scheduler isn't blocked
+        resp = requests.post(url, data=payload, timeout=6)
+        log(f"Sent Telegram message to {target_chat} (status {resp.status_code})")
     except Exception as e:
-        app.logger.exception("Failed to send Telegram message: %s", e)
-
+        log_exc(f"Failed to send Telegram message: {e}")
 
 # ---------------------------------------------------------------------
 # Booking Utils
 # ---------------------------------------------------------------------
 def get_center_schedule(center_id):
     url = f"https://www.cult.fit/api/v2/fitso/web/schedule?centerId={center_id}"
+    log(f"[HTTP] GET {url} (headers masked)")
     resp = requests.get(url=url, headers=HEADERS, timeout=8)
-    return resp.json()
-
+    try:
+        j = resp.json()
+    except Exception:
+        log(f"[HTTP] Failed to parse JSON for schedule: status={resp.status_code} text={resp.text}")
+        raise
+    return j
 
 def convert_utc_to_timestamp(utc_string):
     try:
@@ -95,17 +113,15 @@ def convert_utc_to_timestamp(utc_string):
         timestamp_seconds = int(dt.replace(tzinfo=timezone.utc).timestamp())
         return timestamp_seconds * 1000
     except Exception as e:
-        app.logger.exception("convert_utc_to_timestamp error: %s", e)
+        log_exc(f"convert_utc_to_timestamp error: {e}")
         return None
-
 
 def parse_time_string(time_str):
     try:
         hour, minute = map(int, time_str.split(":")[:2])
         return hour, minute
-    except:
+    except Exception:
         return None, None
-
 
 def matches_preferred_timing(time_str):
     hour, minute = parse_time_string(time_str)
@@ -116,28 +132,27 @@ def matches_preferred_timing(time_str):
             return True
     return False
 
-
 def display_available_slots(schedule_data, sport_id):
-    if "classByDateList" not in schedule_data:
+    if not isinstance(schedule_data, dict) or "classByDateList" not in schedule_data:
         return None
     available = []
     for date_group in schedule_data["classByDateList"]:
-        for time_group in date_group["classByTimeList"]:
-            for slot in time_group["classes"]:
+        for time_group in date_group.get("classByTimeList", []):
+            for slot in time_group.get("classes", []):
                 if (
                     slot.get("workoutId") == sport_id
                     and slot.get("availableSeats", 0) > 0
-                    and matches_preferred_timing(time_group["id"])
+                    and matches_preferred_timing(time_group.get("id", ""))
                 ):
                     available.append({
-                        "class_id": slot["id"],
-                        "date": date_group["id"],
-                        "time": time_group["id"],
-                        "start_time_utc": slot["startDateTimeUTC"],
+                        "class_id": slot.get("id"),
+                        "date": date_group.get("id"),
+                        "time": time_group.get("id"),
+                        "start_time_utc": slot.get("startDateTimeUTC"),
                         "seats": slot.get("availableSeats", 0),
+                        "raw": slot
                     })
     return available if available else None
-
 
 def book_slot(center_id, slot_id, workout_id, booking_timestamp):
     payload = {
@@ -148,24 +163,53 @@ def book_slot(center_id, slot_id, workout_id, booking_timestamp):
     }
     url = "https://www.cult.fit/api/v2/fitso/web/class/book"
     try:
+        # Log request payload (mask cookies/api key not to leak)
+        log(f"[BOOKING] Request -> center={center_id} slot={slot_id} timestamp={booking_timestamp}")
+        log(f"[BOOKING] Payload: {payload}")
         resp = requests.post(url=url, headers=HEADERS, json=payload, timeout=10)
-        data = resp.json()
-        title = data.get("header", {}).get("title", "")
+        # Dump response for debugging
+        log("---- BOOKING RESPONSE START ----")
+        log(f"Status Code: {resp.status_code}")
+        try:
+            data = resp.json()
+            log(f"Response JSON: {data}")
+        except Exception:
+            data = None
+            log(f"Response Text: {resp.text}")
+        log("---- BOOKING RESPONSE END ----")
+
+        title = ""
+        if isinstance(data, dict):
+            title = data.get("header", {}).get("title", "") or ""
+
+        # Diagnose common failure reasons by inspecting response body
         if resp.status_code == 200 and ("Booked" in title or "confirmed" in title.lower()):
-            msg = f"🎉 Booking successful!\nCenter: {center_id}\nSlot ID: {slot_id}\nTime(ts): {booking_timestamp}"
-            app.logger.info(msg)
+            msg = (
+                "🎉 Booking Successful!\n"
+                f"📍 Center: {center_id}\n"
+                f"🆔 Slot ID: {slot_id}\n"
+                f"⏰ Timestamp: {booking_timestamp}"
+            )
+            log(msg)
             send_telegram(msg)
             return True
         else:
-            fail_msg = f"❌ Booking failed for Center {center_id}. Title: {title}"
-            app.logger.warning(fail_msg)
+            # Build a helpful failure message
+            reason = title or (data.get("message") if isinstance(data, dict) else None) or resp.text[:300]
+            fail_msg = (
+                "❌ Booking Failed\n"
+                f"📍 Center: {center_id}\n"
+                f"📝 Reason: {reason}\n"
+                "🔍 See server logs for full API response."
+            )
+            log(fail_msg)
             send_telegram(fail_msg)
             return False
-    except Exception as e:
-        app.logger.exception("book_slot error: %s", e)
-        send_telegram(f"❌ Booking error at center {center_id}: {e}")
-        return False
 
+    except Exception as e:
+        log_exc(f"book_slot exception: {e}")
+        send_telegram(f"❌ Booking exception at center {center_id}: {e}")
+        return False
 
 # ---------------------------------------------------------------------
 # Booking Task
@@ -174,29 +218,47 @@ def booking_task():
     global booking_completed, last_run_time, last_status
 
     last_run_time = datetime.now(IST_ZONE)
-    app.logger.info("Booking job started at %s", last_run_time.isoformat())
+    log(f"[JOB] Booking job started at {last_run_time.isoformat()}")
 
     if not BOOKING_PREFERENCES.get("enabled", True):
-        last_status = "Booking disabled."
-        send_telegram("⚠️ Booking disabled. Use /enable_booking to enable.")
+        last_status = "Booking disabled in preferences."
+        send_telegram("⚠️ Booking is disabled. Use /enable_booking to enable.")
         return
 
     any_slot_found = False
     try:
         for center_id in BOOKING_PREFERENCES["centers"]:
-            schedule_data = get_center_schedule(center_id)
+            log(f"[JOB] Checking center {center_id} for preferred slots...")
+            try:
+                schedule_data = get_center_schedule(center_id)
+            except Exception as e:
+                log_exc(f"[JOB] Failed to fetch schedule for center {center_id}: {e}")
+                continue
+
             available = display_available_slots(schedule_data, BOOKING_PREFERENCES["sport_id"])
+            log(f"[JOB] Available slots for center {center_id}: {available if available else 'None'}")
+
             if available:
                 any_slot_found = True
                 first = available[0]
-                slot_msg = (
-                    f"🏸 Slot Available!\nCenter: {center_id}\nDate: {first['date']}\n"
-                    f"Time: {first['time']}\nSeats: {first['seats']}\nClassID: {first['class_id']}"
-                )
-                app.logger.info(slot_msg)
-                send_telegram(slot_msg)
 
-                booking_timestamp = convert_utc_to_timestamp(first["start_time_utc"])
+                # Nicely formatted slot message
+                slot_msg = (
+                    "🏸 *Slot Available!*\n"
+                    f"📍 Center: {center_id}\n"
+                    f"📅 Date: {first['date']}\n"
+                    f"⏰ Time: {first['time']}\n"
+                    f"🎟 Seats: {first['seats']}\n"
+                    f"🆔 Class ID: {first['class_id']}"
+                )
+                # send plain text but preserve newlines (no markdown mode to avoid escape)
+                send_telegram(slot_msg)
+                log(f"[JOB] Notified Telegram about slot (center {center_id}).")
+
+                booking_timestamp = None
+                if first.get("start_time_utc"):
+                    booking_timestamp = convert_utc_to_timestamp(first["start_time_utc"])
+
                 if booking_timestamp:
                     ok = book_slot(center_id, first["class_id"], BOOKING_PREFERENCES["sport_id"], booking_timestamp)
                     if ok:
@@ -207,16 +269,15 @@ def booking_task():
                         last_status = "Booking attempted but failed."
                 else:
                     last_status = "Could not parse slot timestamp."
-                    send_telegram(f"⚠️ Could not convert slot time for Center {center_id}.")
+                    send_telegram(f"⚠️ Could not convert slot time for Center {center_id} (missing/invalid).")
     except Exception as e:
         last_status = f"Error during booking run: {e}"
-        app.logger.exception("booking_task exception: %s", e)
-        send_telegram(f"❌ Booking job error: {e}\n{traceback.format_exc()}")
+        log_exc(f"[JOB] booking_task exception: {e}\n{traceback.format_exc()}")
+        send_telegram(f"❌ Booking job error: {e}")
 
     if not any_slot_found:
         last_status = "No matching slots found."
-        send_telegram("ℹ️ No matching slots found.")
-
+        send_telegram("ℹ️ No matching slots found in this run.")
 
 # ---------------------------------------------------------------------
 # Scheduler Thread
@@ -227,47 +288,44 @@ class SchedulerThread(threading.Thread):
         self.poll_interval = poll_interval
 
     def run(self):
-        app.logger.info("Scheduler thread running.")
+        log("[SCHEDULER] Thread started.")
         while _scheduler_event.is_set():
             try:
                 schedule.run_pending()
             except Exception:
-                app.logger.exception("Error in scheduled jobs.")
+                log_exc("[SCHEDULER] Error while running scheduled jobs.")
             time.sleep(self.poll_interval)
-        app.logger.info("Scheduler thread exiting.")
-
+        log("[SCHEDULER] Thread exiting.")
 
 def start_scheduler_background():
     global _scheduler_thread
     if _scheduler_event.is_set():
-        app.logger.info("Scheduler already running.")
+        log("[SCHEDULER] Already running.")
         return False
 
     schedule.clear()
-    schedule.every().day.at(SCHEDULE_TIME_ISO).do(booking_task)
+    hh_mm = SCHEDULE_TIME_ISO
+    schedule.every().day.at(hh_mm).do(booking_task)
 
     _scheduler_event.set()
     _scheduler_thread = SchedulerThread()
     _scheduler_thread.start()
-    send_telegram(f"⏰ Scheduler started. Next run daily at {SCHEDULE_TIME_ISO} IST.")
-    app.logger.info("Scheduler started; next run at %s", SCHEDULE_TIME_ISO)
+    send_telegram(f"⏰ Scheduler started. Next run daily at {hh_mm} IST.")
+    log(f"[SCHEDULER] Started; next run at {hh_mm}")
     return True
-
 
 def stop_scheduler_background():
     if not _scheduler_event.is_set():
-        app.logger.info("Scheduler not running.")
+        log("[SCHEDULER] Not running.")
         return False
     _scheduler_event.clear()
     schedule.clear()
     send_telegram("⛔ Scheduler stopped.")
-    app.logger.info("Scheduler stopped.")
+    log("[SCHEDULER] Stopped.")
     return True
-
 
 def scheduler_status():
     return "running" if _scheduler_event.is_set() else "stopped"
-
 
 # ---------------------------------------------------------------------
 # Telegram Webhook
@@ -275,61 +333,70 @@ def scheduler_status():
 def is_admin(chat_id):
     return str(chat_id) == str(TELEGRAM_ADMIN_CHAT_ID)
 
-
 def handle_command(command: str, chat_id: str, text: str = "") -> str:
     cmd = command.strip().lower()
     if cmd == "/start":
+        # Nice looking help menu
         return (
-            "Bot connected.\n\nAvailable commands:\n"
-            "/start - show this\n"
-            "/status - scheduler & booking status\n"
-            "/start_scheduler - start scheduler\n"
-            "/stop_scheduler - stop scheduler\n"
-            "/preferences - view booking preferences\n"
-            "/enable_booking - enable bookings\n"
-            "/disable_booking - disable bookings\n"
-            "/run_now - run booking now\n"
+            "🤖 *CultPlay Scheduler*\n"
+            "Your automated booking assistant.\n\n"
+            "📋 *Commands*\n"
+            "/status - Show scheduler & booking status\n"
+            "/start_scheduler - Start daily scheduler\n"
+            "/stop_scheduler - Stop scheduler\n"
+            "/preferences - View booking preferences\n"
+            "/enable_booking - Enable automatic booking\n"
+            "/disable_booking - Disable automatic booking\n"
+            "/run_now - Run booking immediately (manual)\n"
         )
+
     if not is_admin(chat_id):
-        return "Unauthorized: only admin can control this bot."
+        return "🔒 Unauthorized. Only the bot admin can use control commands."
 
     if cmd == "/status":
-        return (f"Scheduler: {scheduler_status()}\n"
-                f"Booking enabled: {BOOKING_PREFERENCES.get('enabled')}\n"
-                f"Booking completed: {booking_completed}\n"
-                f"Last run: {last_run_time.strftime('%Y-%m-%d %H:%M:%S %Z') if last_run_time else 'never'}\n"
-                f"Last status: {last_status}")
+        return (
+            f"🟢 Scheduler: {scheduler_status()}\n"
+            f"🔔 Booking enabled: {BOOKING_PREFERENCES.get('enabled')}\n"
+            f"✅ Booking completed: {booking_completed}\n"
+            f"⏱ Last run: {last_run_time.strftime('%Y-%m-%d %H:%M:%S %Z') if last_run_time else 'never'}\n"
+            f"📝 Last status: {last_status}"
+        )
 
     if cmd == "/start_scheduler":
         ok = start_scheduler_background()
-        return "Scheduler started." if ok else "Scheduler already running."
+        return "✅ Scheduler started." if ok else "ℹ️ Scheduler already running."
 
     if cmd == "/stop_scheduler":
         ok = stop_scheduler_background()
-        return "Scheduler stopped." if ok else "Scheduler was not running."
+        return "✅ Scheduler stopped." if ok else "ℹ️ Scheduler was not running."
 
     if cmd == "/preferences":
         prefs = BOOKING_PREFERENCES
-        return f"Preferences:\nCenters: {prefs['centers']}\nTimings: {prefs['preferred_timings']}\nSport ID: {prefs['sport_id']}\nEnabled: {prefs['enabled']}"
+        return (
+            f"⚙️ Preferences\n"
+            f"Centers: {prefs['centers']}\n"
+            f"Timings: {prefs['preferred_timings']}\n"
+            f"Sport ID: {prefs['sport_id']}\n"
+            f"Enabled: {prefs['enabled']}"
+        )
 
     if cmd == "/enable_booking":
         BOOKING_PREFERENCES["enabled"] = True
-        return "Booking enabled."
+        return "🔔 Booking enabled."
 
     if cmd == "/disable_booking":
         BOOKING_PREFERENCES["enabled"] = False
-        return "Booking disabled."
+        return "🔕 Booking disabled."
 
     if cmd == "/run_now":
         try:
             booking_task()
-            return "Manual run completed. Check /status."
+            return "⚡ Manual run executed. Check status with /status."
         except Exception as e:
-            app.logger.exception("Manual run error: %s", e)
-            return f"Manual run failed: {e}"
+            log_exc(f"[CMD] Manual run error: {e}")
+            return f"❌ Manual run failed: {e}"
 
-    return "Unknown command. Send /start for help."
-
+    return "❓ Unknown command. Send /start for help."
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -345,12 +412,12 @@ def webhook():
 
             if text.strip().startswith("/"):
                 reply = handle_command(text.strip().split()[0], chat_id, text)
+                # reply to that chat
                 send_telegram(reply, chat_id=str(chat_id))
         return jsonify({"ok": True})
     except Exception as e:
-        app.logger.exception("Error in webhook: %s", e)
+        log_exc(f"[WEBHOOK] Error handling update: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
@@ -364,16 +431,16 @@ def set_webhook():
     resp = requests.post(set_url, data={"url": url_param}, timeout=10)
     return jsonify(resp.json())
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "scheduler": scheduler_status()})
-
 
 # ---------------------------------------------------------------------
 # Run app
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # start scheduler automatically
+    # Start scheduler automatically on boot (you can remove this if you prefer manual start)
     start_scheduler_background()
+    log("App starting - scheduler status: " + scheduler_status())
+    # Run flask
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
