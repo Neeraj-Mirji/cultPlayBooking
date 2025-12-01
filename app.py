@@ -1,6 +1,5 @@
 # main.py
 import os
-import threading
 import traceback
 from datetime import datetime
 from typing import Optional
@@ -9,7 +8,6 @@ import pytz
 import requests
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 # ---------------------------------------------------------------------
 # ENV VARS
@@ -41,8 +39,7 @@ BOOKING_PREFERENCES = {
     "enabled": True,
 }
 
-# Scheduler config
-SCHEDULE_TIME_ISO = os.environ.get("SCHEDULE_TIME", "22:00")
+# Timezone
 IST_ZONE = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------------------
@@ -55,10 +52,9 @@ last_run_time: Optional[datetime] = None
 last_status = ""
 
 scheduler = BackgroundScheduler(timezone=IST_ZONE)
-scheduler_started = False
 
 # ---------------------------------------------------------------------
-# Utilities for logging
+# Utilities
 # ---------------------------------------------------------------------
 def log(msg: str):
     print(msg, flush=True)
@@ -68,20 +64,15 @@ def log_exc(msg: str):
     print(msg, flush=True)
     app.logger.exception(msg)
 
-# ---------------------------------------------------------------------
-# Telegram Helper
-# ---------------------------------------------------------------------
 def send_telegram(message: str, chat_id: Optional[str] = None):
     try:
         if not TELEGRAM_BOT_TOKEN:
             log("No TELEGRAM_BOT_TOKEN set; cannot send Telegram message.")
             return
-
         target_chat = chat_id or TELEGRAM_CHAT_ID
         if not target_chat:
             log("No Telegram chat_id configured; skipping send.")
             return
-
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": target_chat, "text": message}
         resp = requests.post(url, data=payload, timeout=6)
@@ -97,18 +88,17 @@ def get_center_schedule(center_id):
     log(f"[HTTP] GET {url} (headers masked)")
     resp = requests.get(url=url, headers=HEADERS, timeout=8)
     try:
-        j = resp.json()
+        return resp.json()
     except Exception:
         log(f"[HTTP] Failed to parse JSON for schedule: status={resp.status_code} text={resp.text}")
         raise
-    return j
 
 def convert_utc_to_timestamp(utc_string):
     try:
         dt_str = utc_string.replace(" GMT", "")
         dt = datetime.strptime(dt_str, "%a, %d %b %Y %H:%M:%S")
-        timestamp_seconds = int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
-        return timestamp_seconds * 1000
+        dt = dt.replace(tzinfo=pytz.UTC)
+        return int(dt.timestamp()) * 1000
     except Exception as e:
         log_exc(f"convert_utc_to_timestamp error: {e}")
         return None
@@ -162,41 +152,23 @@ def book_slot(center_id, slot_id, workout_id, booking_timestamp):
     try:
         log(f"[BOOKING] Request -> center={center_id} slot={slot_id} timestamp={booking_timestamp}")
         resp = requests.post(url=url, headers=HEADERS, json=payload, timeout=10)
-        log("---- BOOKING RESPONSE START ----")
+        data = None
         try:
             data = resp.json()
-            log(f"Response JSON: {data}")
-        except Exception:
-            data = None
-            log(f"Response Text: {resp.text}")
-        log("---- BOOKING RESPONSE END ----")
-
-        title = ""
-        if isinstance(data, dict):
-            title = data.get("header", {}).get("title", "") or ""
-
+        except:
+            log(f"[BOOKING] Response Text: {resp.text}")
+        title = data.get("header", {}).get("title", "") if isinstance(data, dict) else ""
         if resp.status_code == 200 and ("Booked" in title or "confirmed" in title.lower()):
-            msg = (
-                "🎉 Booking Successful!\n"
-                f"📍 Center: {center_id}\n"
-                f"🆔 Slot ID: {slot_id}\n"
-                f"⏰ Timestamp: {booking_timestamp}"
-            )
+            msg = f"🎉 Booking Successful!\n📍 Center: {center_id}\n🆔 Slot ID: {slot_id}\n⏰ Timestamp: {booking_timestamp}"
             log(msg)
             send_telegram(msg)
             return True
         else:
             reason = title or (data.get("message") if isinstance(data, dict) else resp.text[:300])
-            fail_msg = (
-                "❌ Booking Failed\n"
-                f"📍 Center: {center_id}\n"
-                f"📝 Reason: {reason}\n"
-                "🔍 See server logs for full API response."
-            )
+            fail_msg = f"❌ Booking Failed\n📍 Center: {center_id}\n📝 Reason: {reason}"
             log(fail_msg)
             send_telegram(fail_msg)
             return False
-
     except Exception as e:
         log_exc(f"book_slot exception: {e}")
         send_telegram(f"❌ Booking exception at center {center_id}: {e}")
@@ -232,22 +204,14 @@ def booking_task():
             if available:
                 any_slot_found = True
                 first = available[0]
-
                 slot_msg = (
-                    "🏸 Slot Available!\n"
-                    f"📍 Center: {center_id}\n"
-                    f"📅 Date: {first['date']}\n"
-                    f"⏰ Time: {first['time']}\n"
-                    f"🎟 Seats: {first['seats']}\n"
-                    f"🆔 Class ID: {first['class_id']}"
+                    f"🏸 Slot Available!\n📍 Center: {center_id}\n📅 Date: {first['date']}\n"
+                    f"⏰ Time: {first['time']}\n🎟 Seats: {first['seats']}\n🆔 Class ID: {first['class_id']}"
                 )
                 send_telegram(slot_msg)
                 log(f"[JOB] Notified Telegram about slot (center {center_id}).")
 
-                booking_timestamp = None
-                if first.get("start_time_utc"):
-                    booking_timestamp = convert_utc_to_timestamp(first["start_time_utc"])
-
+                booking_timestamp = convert_utc_to_timestamp(first["start_time_utc"])
                 if booking_timestamp:
                     ok = book_slot(center_id, first["class_id"], BOOKING_PREFERENCES["sport_id"], booking_timestamp)
                     if ok:
@@ -258,7 +222,7 @@ def booking_task():
                         last_status = "Booking attempted but failed."
                 else:
                     last_status = "Could not parse slot timestamp."
-                    send_telegram(f"⚠️ Could not convert slot time for Center {center_id}.")
+                    send_telegram(f"⚠️ Could not convert slot time for Center {center_id} (invalid/missing).")
     except Exception as e:
         last_status = f"Error during booking run: {e}"
         log_exc(f"[JOB] booking_task exception: {e}\n{traceback.format_exc()}")
@@ -269,63 +233,48 @@ def booking_task():
         send_telegram("ℹ️ No matching slots found in this run.")
 
 # ---------------------------------------------------------------------
-# Scheduler control
+# Scheduler Setup
 # ---------------------------------------------------------------------
 def start_scheduler():
-    global scheduler_started
-    if scheduler_started:
-        return False
-    hh_mm = SCHEDULE_TIME_ISO
-    hour, minute = map(int, hh_mm.split(":"))
-    trigger = CronTrigger(hour=hour, minute=minute, timezone=IST_ZONE)
-    scheduler.add_job(booking_task, trigger)
-    scheduler.start()
-    scheduler_started = True
-    send_telegram(f"⏰ Scheduler started. Next run daily at {hh_mm} IST.")
-    log(f"[SCHEDULER] Started; next run at {hh_mm}")
-    return True
+    scheduler.remove_all_jobs()
+    scheduler.add_job(booking_task, 'cron', hour=22, minute=0)  # Runs at 10 PM IST
+    if not scheduler.running:
+        scheduler.start()
+    send_telegram("⏰ Scheduler started. Booking daily at 10 PM IST.")
+    log("[SCHEDULER] Started daily at 10 PM IST.")
 
 def stop_scheduler():
-    global scheduler_started
-    if not scheduler_started:
-        return False
     scheduler.remove_all_jobs()
-    scheduler.shutdown(wait=False)
-    scheduler_started = False
     send_telegram("⛔ Scheduler stopped.")
     log("[SCHEDULER] Stopped.")
-    return True
 
 def scheduler_status():
-    return "running" if scheduler_started else "stopped"
+    return "running" if scheduler.get_jobs() else "stopped"
 
 # ---------------------------------------------------------------------
-# Telegram Bot commands
+# Telegram Webhook
 # ---------------------------------------------------------------------
 def is_admin(chat_id):
     return str(chat_id) == str(TELEGRAM_ADMIN_CHAT_ID)
 
+def supported_commands():
+    return [
+        "/status", "/start_scheduler", "/stop_scheduler",
+        "/preferences", "/enable_booking", "/disable_booking", "/run_now"
+    ]
+
 def handle_command(command: str, chat_id: str, text: str = "") -> str:
     cmd = command.strip().lower()
-
-    help_text = (
-        "🤖 CultPlay Scheduler\n"
-        "Your automated booking assistant.\n\n"
-        "📋 Commands:\n"
-        "/status - Show scheduler & booking status\n"
-        "/start_scheduler - Start daily scheduler\n"
-        "/stop_scheduler - Stop scheduler\n"
-        "/preferences - View booking preferences\n"
-        "/enable_booking - Enable automatic booking\n"
-        "/disable_booking - Disable automatic booking\n"
-        "/run_now - Run booking immediately\n"
-    )
-
     if cmd == "/start":
-        return help_text
+        return (
+            "🤖 CultPlay Scheduler\n"
+            "Automated booking assistant.\n\n"
+            "📋 Commands:\n" +
+            "\n".join(supported_commands())
+        )
 
     if not is_admin(chat_id):
-        return help_text  # Show commands even to unauthorized users
+        return "🔒 Unauthorized. Only bot admin can use control commands."
 
     if cmd == "/status":
         return (
@@ -337,20 +286,18 @@ def handle_command(command: str, chat_id: str, text: str = "") -> str:
         )
 
     if cmd == "/start_scheduler":
-        ok = start_scheduler()
-        return "✅ Scheduler started." if ok else "ℹ️ Scheduler already running."
+        start_scheduler()
+        return "✅ Scheduler started."
 
     if cmd == "/stop_scheduler":
-        ok = stop_scheduler()
-        return "✅ Scheduler stopped." if ok else "ℹ️ Scheduler was not running."
+        stop_scheduler()
+        return "✅ Scheduler stopped."
 
     if cmd == "/preferences":
         prefs = BOOKING_PREFERENCES
         return (
-            f"⚙️ Preferences\n"
-            f"Centers: {prefs['centers']}\n"
-            f"Timings: {prefs['preferred_timings']}\n"
-            f"Sport ID: {prefs['sport_id']}\n"
+            f"⚙️ Preferences\nCenters: {prefs['centers']}\n"
+            f"Timings: {prefs['preferred_timings']}\nSport ID: {prefs['sport_id']}\n"
             f"Enabled: {prefs['enabled']}"
         )
 
@@ -370,12 +317,9 @@ def handle_command(command: str, chat_id: str, text: str = "") -> str:
             log_exc(f"[CMD] Manual run error: {e}")
             return f"❌ Manual run failed: {e}"
 
-    # Unknown commands or any text → show help
-    return help_text
+    # If unknown command, show supported commands
+    return "❓ Unknown command. Supported commands:\n" + "\n".join(supported_commands())
 
-# ---------------------------------------------------------------------
-# Flask Webhook
-# ---------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
@@ -385,8 +329,9 @@ def webhook():
             chat = msg.get("chat", {})
             chat_id = chat.get("id")
             text = msg.get("text", "")
-
-            if text:
+            if not text:
+                return jsonify({"ok": True})
+            if text.strip().startswith("/"):
                 reply = handle_command(text.strip().split()[0], chat_id, text)
                 send_telegram(reply, chat_id=str(chat_id))
         return jsonify({"ok": True})
@@ -394,26 +339,14 @@ def webhook():
         log_exc(f"[WEBHOOK] Error handling update: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/set-webhook", methods=["GET"])
-def set_webhook():
-    token = TELEGRAM_BOT_TOKEN
-    if not token:
-        return "Missing TELEGRAM_BOT_TOKEN env var", 400
-    url_param = request.args.get("url")
-    if not url_param:
-        return "Provide ?url=https://yourdomain.com/webhook", 400
-    set_url = f"https://api.telegram.org/bot{token}/setWebhook"
-    resp = requests.post(set_url, data={"url": url_param}, timeout=10)
-    return jsonify(resp.json())
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "scheduler": scheduler_status()})
 
 # ---------------------------------------------------------------------
-# Run app
+# Run App
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    start_scheduler()
-    log("App starting - scheduler status: " + scheduler_status())
+    start_scheduler()  # Start automatically
+    log(f"App starting - scheduler status: {scheduler_status()}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
